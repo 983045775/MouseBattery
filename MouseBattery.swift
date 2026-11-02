@@ -3,9 +3,13 @@
 //   此前直接用 IOKit 注册 input report 回调收不到回报（该接收器不广播输入报告），
 //   官方 mac 客户端走 node-hid(=hidapi)，实测 hidapi 能稳定收到回报。
 // 协议来自 ATK HUB (v3-hub.atkgear.com) 的 WebHID 驱动实现，真机验证 95%。
+//
+// 通道策略：不常驻持有接收器。每次读取都重新「打开 → 握手 → 请求电量 → 立即关闭」，
+//   避免与浏览器 ATK HUB 网页抢占通道；失败则显示 --，下个周期重新建立通道。
 
 import AppKit
 import Darwin
+import IOKit.hid
 
 // MARK: - 日志（仅 --test / verbose 时输出）
 
@@ -23,105 +27,53 @@ final class DongleClient {
     static let cmdDownloadData: UInt8 = 1   // 握手
     static let cmdBattery: UInt8 = 4        // GetBatteryLevel
     static let usagePageVendor: UInt16 = 0xFF05
+    static let maxAttempts = 3              // 单次刷新内最多重建通道的次数（鼠标休眠时首次请求可能无响应）
 
-    var onBattery: ((Int) -> Void)?
-    var onConnectionChange: ((Bool) -> Void)?
+    /// 每次读取完成后在主线程回调；参数为电量，nil 表示本次读取失败
+    var onResult: ((Int?) -> Void)?
     var verbose = false
 
-    private(set) var isConnected = false
+    /// 仅在主线程读写
     private(set) var lastBattery: Int?
 
-    private var device: OpaquePointer?
-    private var handshakeDone = false
-    private var started = false
-    private var missCount = 0
-    private var reconnectTimer: DispatchSourceTimer?
     private let queue = DispatchQueue(label: "atk.mousebattery.hid")
 
     private enum OpResult { case ok, timeout, error }
     private enum BatteryResult { case level(Int), timeout, error }
-
-    // MARK: 生命周期
+    private enum ReadResult { case report(UInt8, [UInt8]), timeout, error }
 
     func start() {
-        guard !started else { return }
-        started = true
         let rc = atk_hid_init()
         if rc != 0 { log("hid_init 失败: \(rc)") }
+    }
 
-        // 未连接时每 5 秒尝试重连（插上接收器后能快速恢复显示）
-        let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now() + 5, repeating: 5)
-        t.setEventHandler { [weak self] in
+    /// 强制重新建立通道并请求一次电量（串行队列，不会并发操作设备）
+    func refresh() {
+        queue.async { [weak self] in self?.refreshSync() }
+    }
+
+    // MARK: 刷新逻辑（后台队列）
+
+    private func refreshSync() {
+        var level: Int?
+        for attempt in 1...Self.maxAttempts {
+            level = readOnce()
+            if level != nil { break }
+            log("第 \(attempt) 次读取失败")
+            if attempt < Self.maxAttempts { usleep(1_000_000) }
+        }
+        DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            if self.device == nil { self.pollSync() }
-        }
-        t.resume()
-        reconnectTimer = t
-    }
-
-    func pollBattery() {
-        queue.async { [weak self] in self?.pollSync() }
-    }
-
-    // MARK: 轮询逻辑（后台队列）
-
-    private func pollSync() {
-        if device == nil {
-            openDevice()
-        }
-        guard let dev = device else {
-            setDisconnected()
-            return
-        }
-
-        if !handshakeDone {
-            switch handshake(on: dev) {
-            case .ok:
-                handshakeDone = true
-            case .error:
-                log("握手失败：设备断开")
-                closeDevice()
-                return
-            case .timeout:
-                noteMiss()
-                return
-            }
-        }
-
-        switch requestBattery(on: dev) {
-        case .level(let v):
-            missCount = 0
-            setConnected()
-            if lastBattery != v {
-                lastBattery = v
-                notify { [weak self] in self?.onBattery?(v) }
-            }
-        case .error:
-            log("读取失败：设备断开")
-            closeDevice()
-        case .timeout:
-            log("电量请求超时")
-            handshakeDone = false
-            noteMiss()
+            self.lastBattery = level
+            self.onResult?(level)
         }
     }
 
-    private func noteMiss() {
-        missCount += 1
-        if missCount >= 3 {
-            log("连续多次无响应，重开设备")
-            missCount = 0
-            closeDevice()
-        }
-    }
-
-    // MARK: 设备打开
-
-    private func openDevice() {
+    /// 完整走一遍：枚举 → 打开 → 握手 → 取电量 → 关闭
+    private func readOnce() -> Int? {
         guard let head = atk_hid_enumerate(Self.vendorID, Self.productID) else {
             log("未找到 ATK 设备 (VID 0x373B)")
-            return
+            return nil
         }
         defer { atk_hid_free_info(head) }
 
@@ -149,55 +101,51 @@ final class DongleClient {
                 log("打开失败: \(e.path)")
                 continue
             }
+            defer { atk_hid_close(dev) }   // 用完立即释放通道
             atk_hid_set_nonblocking(dev, 1)
             log("已打开: \(e.path) usage_page=0x\(String(e.usagePage, radix: 16))")
-            if handshake(on: dev) == .ok {
-                device = dev
-                handshakeDone = true
-                setConnected()
-                return
-            }
-            atk_hid_close(dev)
-        }
-        log("所有候选设备握手失败")
-    }
 
-    private func closeDevice() {
-        if let d = device { atk_hid_close(d) }
-        device = nil
-        handshakeDone = false
-        setDisconnected()
+            drainInput(dev)
+            guard handshake(on: dev) == .ok else { continue }
+            if case .level(let v) = requestBattery(on: dev) { return v }
+        }
+        log("所有候选接口均未取得电量")
+        return nil
     }
 
     // MARK: 命令收发
+
+    /// 丢弃缓冲中的旧回报，避免把上次残留当成本次回包
+    private func drainInput(_ dev: OpaquePointer) {
+        var buf = [UInt8](repeating: 0, count: 64)
+        for _ in 0..<16 {
+            let n = buf.withUnsafeMutableBufferPointer { p in
+                atk_hid_read(dev, p.baseAddress, 64)
+            }
+            if n <= 0 { break }
+        }
+    }
 
     private func handshake(on dev: OpaquePointer) -> OpResult {
         var rng = SystemRandomNumberGenerator()
         let payload = (0..<4).map { _ in UInt8.random(in: 0...255, using: &rng) }
         sendFrame(cmd: Self.cmdDownloadData, payload: payload, validLen: 8, on: dev)
-        switch readResponse(dev, ms: 700) {
-        case .report(let cmd, _) where cmd == Self.cmdDownloadData:
-            return .ok
-        case .report:
-            return .timeout
-        case .timeout:
-            return .timeout
-        case .error:
-            return .error
+        switch readResponse(dev, cmd: Self.cmdDownloadData, ms: 700) {
+        case .report: return .ok
+        case .timeout: return .timeout
+        case .error: return .error
         }
     }
 
     private func requestBattery(on dev: OpaquePointer) -> BatteryResult {
         sendFrame(cmd: Self.cmdBattery, payload: [], validLen: 0, on: dev)
-        switch readResponse(dev, ms: 700) {
-        case .report(let cmd, let data) where cmd == Self.cmdBattery:
+        switch readResponse(dev, cmd: Self.cmdBattery, ms: 700) {
+        case .report(_, let data):
             let level = Int(data[6])   // 17 字节回报：[0]=ID, [1]=cmd, [5]=validLen, [6]=电量
             if level >= 1 && level <= 100 {
                 log("battery level: \(level)")
                 return .level(level)
             }
-            return .timeout
-        case .report:
             return .timeout
         case .timeout:
             return .timeout
@@ -223,9 +171,8 @@ final class DongleClient {
         }
     }
 
-    private enum ReadResult { case report(UInt8, [UInt8]), timeout, error }
-
-    private func readResponse(_ dev: OpaquePointer, ms: Int) -> ReadResult {
+    /// 等待指定命令的回报，其他命令的回报直接跳过
+    private func readResponse(_ dev: OpaquePointer, cmd: UInt8, ms: Int) -> ReadResult {
         var buf = [UInt8](repeating: 0, count: 64)
         let deadline = Date().addingTimeInterval(Double(ms) / 1000.0)
         while Date() < deadline {
@@ -234,7 +181,7 @@ final class DongleClient {
             }
             if n > 0 {
                 let data = Array(buf[0..<min(Int(n), 64)])
-                if data.count >= 7, data[0] == Self.reportID {
+                if data.count >= 7, data[0] == Self.reportID, data[1] == cmd {
                     return .report(data[1], data)
                 }
             } else if n < 0 {
@@ -250,26 +197,6 @@ final class DongleClient {
         return "?"
     }
 
-    // MARK: 状态
-
-    private func setConnected() {
-        if !isConnected {
-            isConnected = true
-            notify { [weak self] in self?.onConnectionChange?(true) }
-        }
-    }
-
-    private func setDisconnected() {
-        if isConnected {
-            isConnected = false
-            notify { [weak self] in self?.onConnectionChange?(false) }
-        }
-    }
-
-    private func notify(_ f: @escaping () -> Void) {
-        DispatchQueue.main.async { f() }
-    }
-
     private func log(_ s: String) {
         if verbose { mbLog(s) }
     }
@@ -278,11 +205,18 @@ final class DongleClient {
 // MARK: - 菜单栏应用
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    static let pollInterval: TimeInterval = 300   // 自动读取间隔：5 分钟
+    static let wakeDelay: TimeInterval = 5        // 唤醒后等接收器恢复
+
     private var statusItem: NSStatusItem?
     private let client = DongleClient()
     private var pollTimer: Timer?
+    private var wakeWork: DispatchWorkItem?
     private var autoLaunchItem: NSMenuItem?
+    private var refreshItem: NSMenuItem?
+    private var permissionItem: NSMenuItem?
     private var wakeObserver: NSObjectProtocol?
+    private var pending = 0   // 在途刷新数量
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -296,20 +230,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        ensureInputMonitoring()
         setupStatusItem()
-        client.onBattery = { [weak self] _ in self?.updateStatus() }
-        client.onConnectionChange = { [weak self] _ in self?.updateStatus() }
+        client.onResult = { [weak self] _ in
+            guard let self else { return }
+            self.pending = max(0, self.pending - 1)
+            self.updateStatus()
+        }
         client.start()
 
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            self?.client.pollBattery()
-        }
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            self?.client.pollBattery()
+            self?.scheduleWakeRefresh()
         }
-        client.pollBattery()
+        refreshNow()
+    }
+
+    // MARK: 输入监控权限（macOS 要求 HID 设备访问必须授权，否则 IOHIDDeviceOpen 被 TCC 拒绝）
+
+    private var hasInputMonitoring: Bool {
+        IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
+    }
+
+    private func ensureInputMonitoring() {
+        if hasInputMonitoring { return }
+        // 首次会弹出系统授权框，并把本 app 加入「输入监控」列表；菜单栏 app 需先激活才能弹出
+        NSApp.activate(ignoringOtherApps: true)
+        let granted = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+        mbLog("输入监控授权请求结果: \(granted)")
+    }
+
+    @objc private func openInputMonitoringSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// 触发一次读取并重置 5 分钟计时
+    private func triggerRefresh() {
+        pending += 1
+        updateStatus()
+        client.refresh()
+        restartTimer()
+    }
+
+    private func restartTimer() {
+        pollTimer?.invalidate()
+        let t = Timer(timeInterval: Self.pollInterval, repeats: true) { [weak self] _ in
+            self?.triggerRefresh()
+        }
+        RunLoop.main.add(t, forMode: .common)   // 菜单展开时也能触发
+        pollTimer = t
+    }
+
+    private func scheduleWakeRefresh() {
+        wakeWork?.cancel()
+        let w = DispatchWorkItem { [weak self] in self?.triggerRefresh() }
+        wakeWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.wakeDelay, execute: w)
     }
 
     // MARK: UI
@@ -319,6 +298,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = item
 
         let menu = NSMenu()
+        menu.autoenablesItems = false   // 手动控制“刷新中”时的禁用状态
         let titleItem = NSMenuItem(title: "ATK 鼠标电量", action: nil, keyEquivalent: "")
         titleItem.isEnabled = false
         menu.addItem(titleItem)
@@ -327,6 +307,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let refresh = NSMenuItem(title: "刷新电量", action: #selector(refreshNow), keyEquivalent: "r")
         refresh.target = self
         menu.addItem(refresh)
+        refreshItem = refresh
+
+        let perm = NSMenuItem(title: "⚠️ 需要「输入监控」权限，点此打开设置", action: #selector(openInputMonitoringSettings), keyEquivalent: "")
+        perm.target = self
+        perm.isHidden = true
+        menu.addItem(perm)
+        permissionItem = perm
 
         let auto = NSMenuItem(title: "开机自启", action: #selector(toggleAutoLaunch), keyEquivalent: "")
         auto.target = self
@@ -344,8 +331,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateStatus() {
+        refreshItem?.title = pending > 0 ? "刷新中…" : "刷新电量"
+        refreshItem?.isEnabled = pending == 0
+        permissionItem?.isHidden = hasInputMonitoring
+
         guard let b = statusItem?.button else { return }
-        if client.isConnected, let pct = client.lastBattery {
+        if let pct = client.lastBattery {
             b.image = NSImage(systemSymbolName: "computermouse.fill", accessibilityDescription: "mouse")
             b.image?.isTemplate = true
             b.title = " \(pct)%"
@@ -384,14 +375,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
                 (plist as NSDictionary).write(to: agentPath, atomically: true)
             } catch {
-                mbLog("failed to write LaunchAgent: \(error)")
+                mbLog("写入 LaunchAgent 失败: \(error)")
             }
         }
         updateAutoLaunchState()
     }
 
     @objc private func refreshNow() {
-        client.pollBattery()
+        triggerRefresh()
     }
 
     @objc private func quit() {
@@ -402,23 +393,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - 入口
 
 if CommandLine.arguments.contains("--test") {
-    // 命令行测试模式：连接收器读一次电量并打印
+    // 命令行测试模式：重建通道读一次电量并打印
     let client = DongleClient()
     client.verbose = true
-    client.onBattery = { level in
-        print("BATTERY: \(level)%")
-        exit(0)
-    }
-    client.onConnectionChange = { connected in
-        mbLog("connection: \(connected)")
+    client.onResult = { level in
+        if let level {
+            print("BATTERY: \(level)%")
+            exit(0)
+        }
+        print("FAIL: 读取电量失败")
+        exit(1)
     }
     client.start()
-    client.pollBattery()
-    let deadline = Date().addingTimeInterval(8)
+    client.refresh()
+    let deadline = Date().addingTimeInterval(15)
     while Date() < deadline {
         RunLoop.current.run(until: Date().addingTimeInterval(0.2))
     }
-    print("FAIL: no battery response within 8s")
+    print("FAIL: 15 秒内无响应")
     exit(1)
 }
 
