@@ -3,6 +3,7 @@
 ATK / VXE 无线鼠标电量的 macOS 菜单栏小程序：在菜单栏显示一个小鼠标图标 + 电池百分比，仅此而已。
 
 专为 **8K NANO 无线接收器**（VID `0x373B`，PID `0x111B`，如 ATK A9 Pro Max 配套接收器）设计。再也不用打开浏览器去 ATK HUB 网页看电量了。
+<img width="169" height="161" alt="image" src="https://github.com/user-attachments/assets/c3e95619-2781-4fb9-8047-f0c427092dc3" />
 
 ## 功能
 
