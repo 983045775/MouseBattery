@@ -60,6 +60,8 @@ MouseBattery.swift   菜单栏 app（Swift，AppKit + hidapi 桥接）
 atk_bridge.h/.c      hidapi 的 Swift 桥接（隐藏 wchar_t 字段）
 hidapi/              内嵌的 hidapi 源码（mac 后端，含独占打开失败降级补丁）
 build.sh             一键构建 + 打包 .app
+AppIcon.icns         应用图标（鼠标 + ATK 字样）
+make_icon.swift      图标生成脚本（`swiftc make_icon.swift -o make_icon && ./make_icon AppIcon.iconset && iconutil -c icns AppIcon.iconset`）
 ```
 
 ## 协议与参考

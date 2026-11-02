@@ -16,12 +16,14 @@ echo "== 打包 MouseBattery.app =="
 rm -rf MouseBattery.app
 mkdir -p MouseBattery.app/Contents/MacOS MouseBattery.app/Contents/Resources
 cp MouseBattery MouseBattery.app/Contents/MacOS/MouseBattery
+cp AppIcon.icns MouseBattery.app/Contents/Resources/AppIcon.icns
 cat > MouseBattery.app/Contents/Info.plist <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
 	<key>CFBundleExecutable</key><string>MouseBattery</string>
+	<key>CFBundleIconFile</key><string>AppIcon</string>
 	<key>CFBundleIdentifier</key><string>com.atk.mousebattery</string>
 	<key>CFBundleName</key><string>MouseBattery</string>
 	<key>CFBundleDisplayName</key><string>ATK 鼠标电量</string>
