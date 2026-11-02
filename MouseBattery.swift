@@ -48,19 +48,20 @@ final class DongleClient {
     }
 
     /// 强制重新建立通道并请求一次电量（串行队列，不会并发操作设备）
-    func refresh() {
-        queue.async { [weak self] in self?.refreshSync() }
+    /// attempts：本次刷新内最多重建通道的次数
+    func refresh(attempts: Int = DongleClient.maxAttempts) {
+        queue.async { [weak self] in self?.refreshSync(attempts: attempts) }
     }
 
     // MARK: 刷新逻辑（后台队列）
 
-    private func refreshSync() {
+    private func refreshSync(attempts: Int) {
         var level: Int?
-        for attempt in 1...Self.maxAttempts {
+        for attempt in 1...max(1, attempts) {
             level = readOnce()
             if level != nil { break }
             log("第 \(attempt) 次读取失败")
-            if attempt < Self.maxAttempts { usleep(1_000_000) }
+            if attempt < attempts { usleep(1_000_000) }
         }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -205,12 +206,14 @@ final class DongleClient {
 // MARK: - 菜单栏应用
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    static let pollInterval: TimeInterval = 300   // 自动读取间隔：5 分钟
+    static let pollInterval: TimeInterval = 300   // 读取成功后的自动读取间隔：5 分钟
+    static let retryInterval: TimeInterval = 5    // 读取失败（显示 --）后的重试间隔
     static let wakeDelay: TimeInterval = 5        // 唤醒后等接收器恢复
 
     private var statusItem: NSStatusItem?
     private let client = DongleClient()
     private var pollTimer: Timer?
+    private var lastSucceeded = true
     private var wakeWork: DispatchWorkItem?
     private var autoLaunchItem: NSMenuItem?
     private var refreshItem: NSMenuItem?
@@ -237,14 +240,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         ensureInputMonitoring()
         setupStatusItem()
-        client.onResult = { [weak self] _ in
+        client.onResult = { [weak self] level in
             guard let self else { return }
             // 转圈至少显示 0.8 秒，避免读取太快时看不到反馈
             let remain = max(0, Self.minSpinnerTime - Date().timeIntervalSince(self.lastTrigger))
             DispatchQueue.main.asyncAfter(deadline: .now() + remain) { [weak self] in
                 guard let self else { return }
                 self.pending = max(0, self.pending - 1)
+                self.lastSucceeded = level != nil
                 self.updateStatus()
+                // 成功：5 分钟后再读；失败：每 5 秒重试，直到读到为止
+                self.scheduleNext(after: level != nil ? Self.pollInterval : Self.retryInterval)
             }
         }
         client.start()
@@ -277,19 +283,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 触发一次读取并重置 5 分钟计时
-    private func triggerRefresh() {
+    /// 触发一次读取；读取期间不排下一次，结果回来后再按成功/失败决定间隔
+    /// - Parameter quick: 失败后的自动重试只尝试一次，避免单次读取耗时过长导致转圈不断
+    private func triggerRefresh(quick: Bool = false) {
+        pollTimer?.invalidate()
+        pollTimer = nil
         pending += 1
         lastTrigger = Date()
         updateStatus()
-        client.refresh()
-        restartTimer()
+        client.refresh(attempts: quick ? 1 : DongleClient.maxAttempts)
     }
 
-    private func restartTimer() {
+    private func scheduleNext(after interval: TimeInterval) {
         pollTimer?.invalidate()
-        let t = Timer(timeInterval: Self.pollInterval, repeats: true) { [weak self] _ in
-            self?.triggerRefresh()
+        let t = Timer(timeInterval: interval, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.triggerRefresh(quick: !self.lastSucceeded)
         }
         RunLoop.main.add(t, forMode: .common)   // 菜单展开时也能触发
         pollTimer = t
