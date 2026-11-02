@@ -217,6 +217,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var permissionItem: NSMenuItem?
     private var wakeObserver: NSObjectProtocol?
     private var pending = 0   // 在途刷新数量
+    private var baseIcon: NSImage?
+    private var spinnerTimer: Timer?
+    private var spinnerAngle: CGFloat = 90
+    private var lastTrigger = Date.distantPast
+    private static let minSpinnerTime: TimeInterval = 0.8
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -234,8 +239,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupStatusItem()
         client.onResult = { [weak self] _ in
             guard let self else { return }
-            self.pending = max(0, self.pending - 1)
-            self.updateStatus()
+            // 转圈至少显示 0.8 秒，避免读取太快时看不到反馈
+            let remain = max(0, Self.minSpinnerTime - Date().timeIntervalSince(self.lastTrigger))
+            DispatchQueue.main.asyncAfter(deadline: .now() + remain) { [weak self] in
+                guard let self else { return }
+                self.pending = max(0, self.pending - 1)
+                self.updateStatus()
+            }
         }
         client.start()
 
@@ -270,6 +280,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 触发一次读取并重置 5 分钟计时
     private func triggerRefresh() {
         pending += 1
+        lastTrigger = Date()
         updateStatus()
         client.refresh()
         restartTimer()
@@ -304,7 +315,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(titleItem)
         menu.addItem(.separator())
 
-        let refresh = NSMenuItem(title: "刷新电量", action: #selector(refreshNow), keyEquivalent: "r")
+        let refresh = NSMenuItem(title: "刷新电量", action: #selector(refreshNow), keyEquivalent: "")
         refresh.target = self
         menu.addItem(refresh)
         refreshItem = refresh
@@ -321,7 +332,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         autoLaunchItem = auto
 
         menu.addItem(.separator())
-        let quit = NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "")
         quit.target = self
         menu.addItem(quit)
 
@@ -337,16 +348,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard let b = statusItem?.button else { return }
         if let pct = client.lastBattery {
-            b.image = NSImage(systemSymbolName: "computermouse.fill", accessibilityDescription: "mouse")
-            b.image?.isTemplate = true
+            baseIcon = NSImage(systemSymbolName: "computermouse.fill", accessibilityDescription: "mouse")
             b.title = " \(pct)%"
             b.contentTintColor = pct <= 20 ? .systemOrange : nil
         } else {
-            b.image = NSImage(systemSymbolName: "computermouse", accessibilityDescription: "mouse")
-            b.image?.isTemplate = true
+            baseIcon = NSImage(systemSymbolName: "computermouse", accessibilityDescription: "mouse")
             b.title = " --"
             b.contentTintColor = .tertiaryLabelColor
         }
+        baseIcon?.isTemplate = true
+
+        if pending > 0 {
+            startSpinner()
+        } else {
+            stopSpinner()
+        }
+        applyIcon()
+    }
+
+    // MARK: 刷新中的小转圈（画在鼠标图标右侧、数字左侧）
+
+    private func startSpinner() {
+        guard spinnerTimer == nil else { return }
+        let t = Timer(timeInterval: 0.08, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.spinnerAngle = (self.spinnerAngle - 30).truncatingRemainder(dividingBy: 360)
+            self.applyIcon()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        spinnerTimer = t
+    }
+
+    private func stopSpinner() {
+        spinnerTimer?.invalidate()
+        spinnerTimer = nil
+    }
+
+    private func applyIcon() {
+        guard let b = statusItem?.button, let base = baseIcon else { return }
+        b.image = spinnerTimer == nil ? base : Self.iconWithSpinner(base: base, angle: spinnerAngle)
+    }
+
+    private static func iconWithSpinner(base: NSImage, angle: CGFloat) -> NSImage {
+        let spin: CGFloat = 11, gap: CGFloat = 3
+        let h = max(base.size.height, spin)
+        let size = NSSize(width: base.size.width + gap + spin, height: h)
+        let img = NSImage(size: size, flipped: false) { _ in
+            base.draw(in: NSRect(x: 0, y: (h - base.size.height) / 2,
+                                 width: base.size.width, height: base.size.height))
+            let center = NSPoint(x: base.size.width + gap + spin / 2, y: h / 2)
+            let arc = NSBezierPath()
+            arc.appendArc(withCenter: center, radius: spin / 2 - 1,
+                          startAngle: angle, endAngle: angle + 270, clockwise: false)
+            arc.lineWidth = 1.6
+            arc.lineCapStyle = .round
+            NSColor.black.setStroke()
+            arc.stroke()
+            return true
+        }
+        img.isTemplate = true
+        return img
     }
 
     // MARK: 开机自启（LaunchAgent）

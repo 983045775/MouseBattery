@@ -36,6 +36,7 @@ cat > MouseBattery.app/Contents/Info.plist <<'EOF'
 </dict>
 </plist>
 EOF
-codesign --force --deep -s - MouseBattery.app
+# 指定以 identifier 为准的 designated requirement，使重新编译后「输入监控」授权不因 cdhash 变化而失效
+codesign --force --deep -s - -r="designated => identifier \"com.atk.mousebattery\"" MouseBattery.app
 
 echo "OK: $(pwd)/MouseBattery.app"
